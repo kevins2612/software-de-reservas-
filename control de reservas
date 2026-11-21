@@ -1,0 +1,1002 @@
+# software-de-reservas-
+import logging
+import os
+import re
+from abc import ABC, abstractmethod
+from datetime import datetime
+
+# El log se guarda en la misma carpeta donde esta este archivo .py
+# (asi siempre se sabe donde buscarlo)
+RUTA_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "software_fj.log")
+
+# Configuracion del archivo de logs
+logging.basicConfig(
+    filename=RUTA_LOG,
+    filemode="w",  # "w" borra el log anterior cada vez que se abre el programa
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("SoftwareFJ")
+
+
+# ---------------------------------------------------------
+# EXCEPCIONES PERSONALIZADAS
+# ---------------------------------------------------------
+
+# Excepcion base, las demas heredan de esta
+class SoftwareFJError(Exception):
+    pass
+
+
+# Cuando los datos del cliente estan mal
+class ClienteInvalidoError(SoftwareFJError):
+    pass
+
+
+# Cuando los datos de un servicio estan mal
+class ServicioInvalidoError(SoftwareFJError):
+    pass
+
+
+# Cuando el servicio no se puede reservar
+class ServicioNoDisponibleError(SoftwareFJError):
+    pass
+
+
+# Cuando la reserva tiene datos incorrectos
+class ReservaInvalidaError(SoftwareFJError):
+    pass
+
+
+# Cuando se hace algo que no se puede en ese estado
+class OperacionNoPermitidaError(SoftwareFJError):
+    pass
+
+
+# Cuando un calculo da un resultado raro
+class CalculoInconsistenteError(SoftwareFJError):
+    pass
+
+
+# No es un error: se usa cuando el usuario elige "0" para volver atras
+class VolverAtras(Exception):
+    pass
+
+
+# ---------------------------------------------------------
+# CLASE ABSTRACTA GENERAL
+# ---------------------------------------------------------
+
+# Clase base para todas las entidades (no se puede instanciar)
+class EntidadBase(ABC):
+    _contador = 0  # lleva la cuenta para dar ids
+
+    def __init__(self):
+        EntidadBase._contador += 1
+        self._id = EntidadBase._contador
+        self._fecha_creacion = datetime.now()
+
+    @property
+    def id(self):
+        return self._id
+
+    # Cada clase hija debe escribir su propia descripcion
+    @abstractmethod
+    def describir(self):
+        pass
+
+    def __str__(self):
+        return self.describir()
+
+
+# ---------------------------------------------------------
+# CLIENTE
+# ---------------------------------------------------------
+
+class Cliente(EntidadBase):
+    # Patron simple para revisar el correo
+    _PATRON_EMAIL = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$")
+
+    def __init__(self, nombre=None, documento=None, email=None, telefono=None):
+        super().__init__()
+        # Atributos privados (encapsulacion)
+        self.__nombre = None
+        self.__documento = None
+        self.__email = None
+        self.__telefono = None
+        # Al asignar se llaman los setters que validan
+        self.nombre = nombre
+        self.documento = documento
+        self.email = email
+        self.telefono = telefono
+
+    # --- nombre ---
+    @property
+    def nombre(self):
+        return self.__nombre
+
+    @nombre.setter
+    def nombre(self, valor):
+        if valor is None:
+            raise ClienteInvalidoError("Falta el nombre")
+        if not isinstance(valor, str) or len(valor.strip()) < 3:
+            raise ClienteInvalidoError(f"Nombre invalido: {valor!r}")
+        if any(c.isdigit() for c in valor):
+            raise ClienteInvalidoError("El nombre no puede tener numeros")
+        self.__nombre = valor.strip().title()
+
+    # --- documento ---
+    @property
+    def documento(self):
+        return self.__documento
+
+    @documento.setter
+    def documento(self, valor):
+        if valor is None:
+            raise ClienteInvalidoError("Falta el documento")
+        valor = str(valor).strip()
+        if not valor.isdigit() or not (6 <= len(valor) <= 12):
+            raise ClienteInvalidoError(f"Documento invalido: {valor!r} (6 a 12 digitos)")
+        self.__documento = valor
+
+    # --- email ---
+    @property
+    def email(self):
+        return self.__email
+
+    @email.setter
+    def email(self, valor):
+        if valor is None:
+            raise ClienteInvalidoError("Falta el email")
+        if not isinstance(valor, str) or not self._PATRON_EMAIL.match(valor.strip()):
+            raise ClienteInvalidoError(f"Email invalido: {valor!r}")
+        self.__email = valor.strip().lower()
+
+    # --- telefono ---
+    @property
+    def telefono(self):
+        return self.__telefono
+
+    @telefono.setter
+    def telefono(self, valor):
+        if valor is None:
+            raise ClienteInvalidoError("Falta el telefono")
+        valor = str(valor).strip()
+        if not valor.isdigit() or len(valor) != 10:
+            raise ClienteInvalidoError(f"Telefono invalido: {valor!r} (10 digitos)")
+        self.__telefono = valor
+
+    # Valida un solo dato (nombre, documento, email o telefono)
+    # Se usa en el menu para repetir solo el dato que estuvo mal
+    @staticmethod
+    def validar_campo(campo, valor):
+        temporal = Cliente.__new__(Cliente)  # cliente vacio, solo para usar los setters
+        setattr(temporal, campo, valor)      # aqui se valida
+        return getattr(temporal, campo)      # devuelve el dato ya limpio
+
+    def describir(self):
+        return f"Cliente #{self.id}: {self.nombre} | Doc: {self.documento} | {self.email}"
+
+
+# ---------------------------------------------------------
+# SERVICIOS
+# ---------------------------------------------------------
+
+# Clase abstracta, de aqui salen los servicios especificos
+class Servicio(EntidadBase, ABC):
+    IVA = 0.19  # impuesto por defecto
+
+    def __init__(self, nombre, tarifa_hora, disponible=True):
+        super().__init__()
+        self._validar_base(nombre, tarifa_hora)
+        self._nombre = nombre.strip()
+        self._tarifa_hora = float(tarifa_hora)
+        self._disponible = bool(disponible)
+
+    # Revisa el nombre y la tarifa
+    @staticmethod
+    def _validar_base(nombre, tarifa):
+        if not isinstance(nombre, str) or not nombre.strip():
+            raise ServicioInvalidoError("El nombre del servicio es obligatorio")
+        if not isinstance(tarifa, (int, float)) or isinstance(tarifa, bool) or tarifa <= 0:
+            raise ServicioInvalidoError(f"Tarifa invalida: {tarifa!r}")
+
+    @property
+    def nombre(self):
+        return self._nombre
+
+    @property
+    def tarifa_hora(self):
+        return self._tarifa_hora
+
+    @property
+    def disponible(self):
+        return self._disponible
+
+    @disponible.setter
+    def disponible(self, valor):
+        self._disponible = bool(valor)
+
+    # Metodos abstractos: cada servicio los hace a su manera (polimorfismo)
+    @abstractmethod
+    def calcular_costo_base(self, horas):
+        pass
+
+    @abstractmethod
+    def validar_parametros(self, horas):
+        pass
+
+    # Metodo sobrecargado: se puede llamar de varias formas
+    #   calcular_costo(horas)
+    #   calcular_costo(horas, impuesto)
+    #   calcular_costo(horas, impuesto, descuento)
+    #   calcular_costo(horas, descuento=0.1)
+    def calcular_costo(self, horas, *args, impuesto=None, descuento=None):
+        if len(args) > 2:
+            raise CalculoInconsistenteError("Demasiados argumentos")
+        if len(args) >= 1:
+            impuesto = args[0]
+        if len(args) == 2:
+            descuento = args[1]
+
+        self.validar_parametros(horas)
+        costo = self.calcular_costo_base(horas)
+
+        # Se aplica el descuento si lo hay
+        if descuento is not None:
+            if not 0 <= descuento < 1:
+                raise CalculoInconsistenteError(f"Descuento fuera de rango: {descuento}")
+            costo -= costo * descuento
+
+        # Se aplica el impuesto si lo hay
+        if impuesto is not None:
+            if not 0 <= impuesto <= 1:
+                raise CalculoInconsistenteError(f"Impuesto fuera de rango: {impuesto}")
+            costo += costo * impuesto
+
+        if costo <= 0:
+            raise CalculoInconsistenteError(f"Costo inconsistente: {costo}")
+        return round(costo, 2)
+
+    def describir(self):
+        estado = "Disponible" if self._disponible else "No disponible"
+        return f"{self.__class__.__name__} #{self.id}: {self.nombre} (${self.tarifa_hora:,.0f}/h) [{estado}]"
+
+
+# Servicio 1: reserva de salas
+class ReservaSala(Servicio):
+    def __init__(self, nombre, tarifa_hora, capacidad, disponible=True):
+        super().__init__(nombre, tarifa_hora, disponible)
+        if not isinstance(capacidad, int) or capacidad <= 0:
+            raise ServicioInvalidoError(f"Capacidad invalida: {capacidad!r}")
+        self._capacidad = capacidad
+
+    # Una sala se reserva de 1 a 12 horas
+    def validar_parametros(self, horas):
+        if not isinstance(horas, (int, float)) or not 1 <= horas <= 12:
+            raise ServicioInvalidoError("Una sala se reserva entre 1 y 12 horas")
+
+    def calcular_costo_base(self, horas):
+        return self.tarifa_hora * horas
+
+    def describir(self):
+        return super().describir() + f" | Capacidad: {self._capacidad} personas"
+
+
+# Servicio 2: alquiler de equipos
+class AlquilerEquipo(Servicio):
+    def __init__(self, nombre, tarifa_hora, tipo_equipo, deposito=0, disponible=True):
+        super().__init__(nombre, tarifa_hora, disponible)
+        if not tipo_equipo or not isinstance(tipo_equipo, str):
+            raise ServicioInvalidoError("El tipo de equipo es obligatorio")
+        if deposito < 0:
+            raise ServicioInvalidoError("El deposito no puede ser negativo")
+        self._tipo_equipo = tipo_equipo
+        self._deposito = deposito
+
+    # Un equipo se alquila de 1 a 72 horas
+    def validar_parametros(self, horas):
+        if not isinstance(horas, (int, float)) or not 1 <= horas <= 72:
+            raise ServicioInvalidoError("Un equipo se alquila entre 1 y 72 horas")
+
+    # Aqui se suma el deposito al costo
+    def calcular_costo_base(self, horas):
+        return self.tarifa_hora * horas + self._deposito
+
+    def describir(self):
+        return super().describir() + f" | Equipo: {self._tipo_equipo} | Deposito: ${self._deposito:,.0f}"
+
+
+# Servicio 3: asesorias especializadas
+class AsesoriaEspecializada(Servicio):
+    def __init__(self, nombre, tarifa_hora, especialidad, nivel="junior", disponible=True):
+        super().__init__(nombre, tarifa_hora, disponible)
+        if nivel not in ("junior", "senior"):
+            raise ServicioInvalidoError(f"Nivel invalido: {nivel!r}")
+        if not especialidad:
+            raise ServicioInvalidoError("La especialidad es obligatoria")
+        self._especialidad = especialidad
+        self._nivel = nivel
+
+    # Una asesoria dura de media hora a 8 horas
+    def validar_parametros(self, horas):
+        if not isinstance(horas, (int, float)) or not 0.5 <= horas <= 8:
+            raise ServicioInvalidoError("Una asesoria dura entre 0.5 y 8 horas")
+
+    # El asesor senior cobra 50% mas
+    def calcular_costo_base(self, horas):
+        recargo = 1.5 if self._nivel == "senior" else 1.0
+        return self.tarifa_hora * horas * recargo
+
+    def describir(self):
+        return super().describir() + f" | Especialidad: {self._especialidad} ({self._nivel})"
+
+
+# ---------------------------------------------------------
+# RESERVA
+# ---------------------------------------------------------
+
+class Reserva(EntidadBase):
+    # Estados posibles de una reserva
+    PENDIENTE = "PENDIENTE"
+    CONFIRMADA = "CONFIRMADA"
+    CANCELADA = "CANCELADA"
+    PROCESADA = "PROCESADA"
+
+    def __init__(self, cliente, servicio, horas):
+        super().__init__()
+        # Se revisa que los datos sean correctos
+        if not isinstance(cliente, Cliente):
+            raise ReservaInvalidaError("Se necesita un Cliente valido")
+        if not isinstance(servicio, Servicio):
+            raise ReservaInvalidaError("Se necesita un Servicio valido")
+        if not servicio.disponible:
+            raise ServicioNoDisponibleError(f"El servicio '{servicio.nombre}' no esta disponible")
+        try:
+            servicio.validar_parametros(horas)
+        except ServicioInvalidoError as e:
+            # Encadenamiento: se conserva el error original con "from e"
+            raise ReservaInvalidaError(f"Duracion invalida: {horas!r}") from e
+        self._cliente = cliente
+        self._servicio = servicio
+        self._horas = horas
+        self._estado = Reserva.PENDIENTE
+        self._costo_final = None
+
+    @property
+    def estado(self):
+        return self._estado
+
+    @property
+    def costo_final(self):
+        return self._costo_final
+
+    # Solo se confirma si esta pendiente
+    def confirmar(self):
+        if self._estado != Reserva.PENDIENTE:
+            raise OperacionNoPermitidaError(f"No se puede confirmar, estado actual: {self._estado}")
+        self._estado = Reserva.CONFIRMADA
+
+    # No se cancela si ya esta cancelada o procesada
+    def cancelar(self):
+        if self._estado in (Reserva.CANCELADA, Reserva.PROCESADA):
+            raise OperacionNoPermitidaError(f"No se puede cancelar, estado actual: {self._estado}")
+        self._estado = Reserva.CANCELADA
+
+    # Metodo sobrecargado:
+    #   procesar()                    -> usa IVA por defecto
+    #   procesar(descuento)           -> IVA por defecto y descuento
+    #   procesar(impuesto, descuento) -> los dos personalizados
+    def procesar(self, *args):
+        if self._estado != Reserva.CONFIRMADA:
+            raise OperacionNoPermitidaError(f"Solo se procesan reservas confirmadas (estado: {self._estado})")
+        try:
+            if len(args) == 0:
+                costo = self._servicio.calcular_costo(self._horas, Servicio.IVA)
+            elif len(args) == 1:
+                costo = self._servicio.calcular_costo(self._horas, Servicio.IVA, args[0])
+            elif len(args) == 2:
+                costo = self._servicio.calcular_costo(self._horas, args[0], args[1])
+            else:
+                raise CalculoInconsistenteError("procesar() recibe maximo 2 argumentos")
+        except CalculoInconsistenteError as e:
+            raise ReservaInvalidaError("No se pudo procesar la reserva") from e
+        else:
+            # Si todo salio bien se guarda el costo y cambia el estado
+            self._costo_final = costo
+            self._estado = Reserva.PROCESADA
+            return costo
+
+    def describir(self):
+        texto = (f"Reserva #{self.id} [{self._estado}] {self._cliente.nombre} -> "
+                 f"{self._servicio.nombre} x {self._horas}h")
+        if self._costo_final:
+            texto += f" = ${self._costo_final:,.2f}"
+        return texto
+
+
+# ---------------------------------------------------------
+# GESTOR PRINCIPAL
+# ---------------------------------------------------------
+
+# Guarda todo en listas (no hay base de datos)
+class GestorSoftwareFJ:
+    def __init__(self):
+        self._clientes = []
+        self._servicios = []
+        self._reservas = []
+
+    # Ejecuta una operacion y atrapa los errores para que el programa no se caiga
+    def _ejecutar(self, nombre_op, funcion):
+        print(f"\n>>> {nombre_op}")
+        logger.info("INICIO: %s", nombre_op)
+        resultado = None
+        try:
+            resultado = funcion()
+        except SoftwareFJError as e:
+            # Error propio del sistema
+            causa = f" (causa: {e.__cause__})" if e.__cause__ else ""
+            logger.error("%s FALLO [%s]: %s%s", nombre_op, type(e).__name__, e, causa)
+            print(f"    [ERROR CONTROLADO] {type(e).__name__}: {e}{causa}")
+        except VolverAtras:
+            # El usuario eligio volver al menu (no es un error)
+            logger.info("%s: el usuario volvio al menu", nombre_op)
+            print("    Volviste al menu principal")
+        except Exception as e:
+            # Cualquier otro error que no esperabamos
+            logger.critical("%s ERROR INESPERADO [%s]: %s", nombre_op, type(e).__name__, e)
+            print(f"    [ERROR INESPERADO] {type(e).__name__}: {e}")
+        else:
+            # Si no hubo error
+            logger.info("EXITO: %s", nombre_op)
+            print(f"    [OK] {resultado}")
+        finally:
+            # Esto se ejecuta siempre
+            logger.info("FIN: %s", nombre_op)
+        return resultado
+
+    def registrar_cliente(self, **datos):
+        cliente = Cliente(**datos)
+        # No se permiten documentos repetidos
+        if any(c.documento == cliente.documento for c in self._clientes):
+            raise ClienteInvalidoError(f"Ya existe un cliente con documento {cliente.documento}")
+        self._clientes.append(cliente)
+        return cliente.describir()
+
+    def registrar_servicio(self, clase, *args, **kwargs):
+        servicio = clase(*args, **kwargs)
+        self._servicios.append(servicio)
+        return servicio.describir()
+
+    # Busca un elemento en una lista (empieza en 0)
+    # Se revisa que no sea negativo porque en Python -1 seria el ultimo
+    def _obtener(self, lista, idx, nombre):
+        try:
+            if idx < 0:
+                raise IndexError
+            return lista[idx]
+        except IndexError as e:
+            raise ReservaInvalidaError(f"El {nombre} no existe") from e
+
+    def crear_reserva(self, idx_cliente, idx_servicio, horas, confirmar=True):
+        cliente = self._obtener(self._clientes, idx_cliente, "cliente")
+        servicio = self._obtener(self._servicios, idx_servicio, "servicio")
+        reserva = Reserva(cliente, servicio, horas)
+        if confirmar:
+            reserva.confirmar()
+        self._reservas.append(reserva)
+        return reserva.describir()
+
+    def confirmar_reserva(self, idx):
+        reserva = self._obtener(self._reservas, idx, "reserva")
+        reserva.confirmar()
+        return reserva.describir()
+
+    def procesar_reserva(self, idx, *args):
+        reserva = self._obtener(self._reservas, idx, "reserva")
+        reserva.procesar(*args)
+        return reserva.describir()
+
+    def cancelar_reserva(self, idx):
+        reserva = self._obtener(self._reservas, idx, "reserva")
+        reserva.cancelar()
+        return reserva.describir()
+
+    def documento_existe(self, documento):
+        return any(c.documento == documento for c in self._clientes)
+
+    def servicio_en(self, idx):
+        return self._obtener(self._servicios, idx, "servicio")
+
+    def reserva_en(self, idx):
+        return self._obtener(self._reservas, idx, "reserva")
+
+    # Texto corto con la cantidad de datos (se muestra en el menu)
+    def estado(self):
+        return (f"Clientes: {len(self._clientes)} | Servicios: {len(self._servicios)} | "
+                f"Reservas: {len(self._reservas)}")
+
+    # Devuelven las listas como texto numerado (desde 1)
+    def listar_clientes(self):
+        return [f"{i}. {c.describir()}" for i, c in enumerate(self._clientes, 1)]
+
+    def listar_servicios(self):
+        return [f"{i}. {s.describir()}" for i, s in enumerate(self._servicios, 1)]
+
+    def listar_reservas(self):
+        return [f"{i}. {r.describir()}" for i, r in enumerate(self._reservas, 1)]
+
+    # Muestra el resumen al final
+    def resumen(self):
+        print("\n" + "=" * 70)
+        print("RESUMEN FINAL")
+        print("=" * 70)
+        print(f"Clientes: {len(self._clientes)} | Servicios: {len(self._servicios)} | "
+              f"Reservas: {len(self._reservas)}")
+        for r in self._reservas:
+            print("  -", r.describir())
+        print("Revisar 'software_fj.log' para ver los eventos y errores.")
+
+
+# ---------------------------------------------------------
+# SIMULACION (22 operaciones, validas e invalidas)
+# ---------------------------------------------------------
+
+def simular():
+    g = GestorSoftwareFJ()
+    ej = g._ejecutar  # nombre corto para escribir menos
+
+    # --- Clientes ---
+    ej("1. Registrar cliente valido (Ana)", lambda: g.registrar_cliente(
+        nombre="ana perez", documento="1020304050", email="ana@correo.com", telefono="3001234567"))
+    ej("2. Registrar cliente valido (Luis)", lambda: g.registrar_cliente(
+        nombre="Luis Gomez", documento="998877665", email="luis@mail.co", telefono="3109876543"))
+    ej("3. Cliente con email invalido", lambda: g.registrar_cliente(
+        nombre="Carlos Ruiz", documento="123456789", email="carlos#correo", telefono="3001112233"))
+    ej("4. Cliente sin telefono (dato faltante)", lambda: g.registrar_cliente(
+        nombre="Marta Diaz", documento="555666777", email="marta@mail.com"))
+    ej("5. Cliente con documento repetido", lambda: g.registrar_cliente(
+        nombre="Ana Clon", documento="1020304050", email="clon@mail.com", telefono="3000000000"))
+
+    # --- Servicios ---
+    ej("6. Crear sala valida", lambda: g.registrar_servicio(
+        ReservaSala, "Sala Innovacion", 50000, 10))
+    ej("7. Crear alquiler de equipo valido", lambda: g.registrar_servicio(
+        AlquilerEquipo, "Proyector 4K", 20000, "Proyector", deposito=30000))
+    ej("8. Crear asesoria senior valida", lambda: g.registrar_servicio(
+        AsesoriaEspecializada, "Asesoria Cloud", 80000, "Cloud", "senior"))
+    ej("9. Crear servicio con tarifa negativa", lambda: g.registrar_servicio(
+        ReservaSala, "Sala Rota", -100, 5))
+    ej("10. Crear sala no disponible (mantenimiento)", lambda: g.registrar_servicio(
+        ReservaSala, "Sala Mantenimiento", 40000, 6, disponible=False))
+
+    # --- Reservas ---
+    ej("11. Reserva exitosa (Ana - Sala, 3h)", lambda: g.crear_reserva(0, 0, 3))
+    ej("12. Reserva con duracion invalida (Luis - Sala, 20h)", lambda: g.crear_reserva(1, 0, 20))
+    ej("13. Reserva de servicio no disponible", lambda: g.crear_reserva(0, 3, 2))
+    ej("14. Reserva con cliente que no existe", lambda: g.crear_reserva(9, 0, 2))
+    ej("15. Reserva exitosa (Luis - Asesoria senior, 2h)", lambda: g.crear_reserva(1, 2, 2))
+    ej("16. Reserva exitosa (Ana - Equipo, 5h)", lambda: g.crear_reserva(0, 1, 5))
+
+    # --- Procesar y cancelar (se prueba la sobrecarga) ---
+    ej("17. Procesar reserva 0 (solo IVA por defecto)", lambda: g.procesar_reserva(0))
+    ej("18. Procesar reserva 1 con 10% de descuento", lambda: g.procesar_reserva(1, 0.10))
+    ej("19. Procesar reserva 2 con IVA 5% y descuento 15%", lambda: g.procesar_reserva(2, 0.05, 0.15))
+    ej("20. Procesar una reserva ya procesada", lambda: g.procesar_reserva(0))
+    ej("21. Cancelar una reserva ya procesada", lambda: g.cancelar_reserva(0))
+    ej("22. Descuento fuera de rango", lambda: g._servicios[0].calcular_costo(2, 0.19, 1.5))
+
+    # Al final el programa sigue funcionando
+    g.resumen()
+
+
+# ---------------------------------------------------------
+# MENU INTERACTIVO (el usuario escribe los datos)
+# ---------------------------------------------------------
+
+# Pide un dato y lo repite SOLO ese dato hasta que sea valido
+# "validar" es una funcion que devuelve el dato bien o lanza un error
+def pedir(mensaje, validar):
+    while True:
+        valor = input(mensaje).strip()
+        if valor.lower() == "cancelar":
+            raise OperacionNoPermitidaError("Operacion cancelada por el usuario")
+        try:
+            return validar(valor if valor else None)  # vacio = dato faltante
+        except SoftwareFJError as e:
+            # Se guarda el error en el log y se avisa, pero no se sale
+            logger.error("Dato invalido en '%s': [%s] %s", mensaje.strip(), type(e).__name__, e)
+            print(f"    [ALERTA] {e}. Intenta de nuevo.")
+
+
+# ----- Validadores pequenos (cada uno revisa un tipo de dato) -----
+def a_numero(valor):
+    if valor is None:
+        raise SoftwareFJError("Falta el dato")
+    try:
+        return float(valor.replace(",", "."))
+    except ValueError as e:
+        raise SoftwareFJError("Debes escribir un numero valido") from e
+
+
+def a_entero(valor):
+    if valor is None:
+        raise SoftwareFJError("Falta el dato")
+    try:
+        return int(valor)
+    except ValueError as e:
+        raise SoftwareFJError("Debes escribir un numero entero") from e
+
+
+def texto_obligatorio(nombre_dato):
+    def validar(valor):
+        if valor is None:
+            raise ServicioInvalidoError(f"Falta {nombre_dato}")
+        return valor
+    return validar
+
+
+def en_rango(minimo, maximo):
+    def validar(valor):
+        n = a_entero(valor)
+        if not minimo <= n <= maximo:
+            raise SoftwareFJError(f"Elige un numero entre {minimo} y {maximo}")
+        return n
+    return validar
+
+
+def numero_positivo(valor):
+    n = a_numero(valor)
+    if n <= 0:
+        raise ServicioInvalidoError("Debe ser mayor que 0")
+    return n
+
+
+def numero_no_negativo(valor):
+    n = a_numero(valor)
+    if n < 0:
+        raise ServicioInvalidoError("No puede ser negativo")
+    return n
+
+
+def entero_positivo(valor):
+    n = a_entero(valor)
+    if n <= 0:
+        raise ServicioInvalidoError("Debe ser mayor que 0")
+    return n
+
+
+def nivel_valido(valor):
+    if valor is None or valor.lower() not in ("junior", "senior"):
+        raise ServicioInvalidoError("El nivel debe ser junior o senior")
+    return valor.lower()
+
+
+def porcentaje(nombre, maximo):
+    def validar(valor):
+        n = a_numero(valor)
+        if not 0 <= n <= maximo:
+            raise CalculoInconsistenteError(f"{nombre} fuera de rango (0 a {maximo})")
+        return n
+    return validar
+
+
+# ----- Cliente -----
+def campo_cliente(g, campo):
+    def validar(valor):
+        dato = Cliente.validar_campo(campo, valor)
+        if campo == "documento" and g.documento_existe(dato):
+            raise ClienteInvalidoError(f"Ya existe un cliente con documento {dato}")
+        return dato
+    return validar
+
+
+def menu_registrar_cliente(g):
+    nombre = pedir("Nombre: ", campo_cliente(g, "nombre"))
+    documento = pedir("Documento (6 a 12 digitos): ", campo_cliente(g, "documento"))
+    email = pedir("Email: ", campo_cliente(g, "email"))
+    telefono = pedir("Telefono (10 digitos): ", campo_cliente(g, "telefono"))
+    return g.registrar_cliente(nombre=nombre, documento=documento, email=email, telefono=telefono)
+
+
+# ----- Servicio -----
+# Servicios que ofrece Software FJ (asi el usuario solo elige de la lista)
+# Cada opcion es: (nombre, tarifa por hora, datos extra segun el tipo)
+CATALOGO = {
+    "1": ("SALAS", ReservaSala, [
+        ("Sala Pequena", 30000, {"capacidad": 4}),
+        ("Sala Mediana", 50000, {"capacidad": 10}),
+        ("Sala Auditorio", 120000, {"capacidad": 50}),
+    ]),
+    "2": ("EQUIPOS", AlquilerEquipo, [
+        ("Portatil", 15000, {"tipo_equipo": "Portatil", "deposito": 50000}),
+        ("Proyector 4K", 20000, {"tipo_equipo": "Proyector", "deposito": 30000}),
+        ("Camara Profesional", 25000, {"tipo_equipo": "Camara", "deposito": 40000}),
+    ]),
+    "3": ("ASESORIAS", AsesoriaEspecializada, [
+        ("Asesoria Desarrollo Web", 60000, {"especialidad": "Desarrollo Web", "nivel": "junior"}),
+        ("Asesoria Ciberseguridad", 90000, {"especialidad": "Ciberseguridad", "nivel": "senior"}),
+        ("Asesoria Cloud", 80000, {"especialidad": "Cloud", "nivel": "senior"}),
+    ]),
+}
+
+
+# Valida una opcion de lista: el 0 significa volver atras
+def opcion_o_volver(maximo):
+    def validar(valor):
+        n = a_entero(valor)
+        if n == 0:
+            raise VolverAtras()
+        if not 1 <= n <= maximo:
+            raise SoftwareFJError(f"Elige un numero entre 0 y {maximo}")
+        return n
+    return validar
+
+
+def menu_registrar_servicio(g):
+    while True:
+        print("\nTipo de servicio:")
+        print("    1. Sala")
+        print("    2. Equipo")
+        print("    3. Asesoria")
+        print("    0. Volver al menu")
+        # Si elige 0 sale al menu principal
+        tipo = str(pedir("Elige el tipo: ", opcion_o_volver(3)))
+
+        titulo, clase, opciones = CATALOGO[tipo]
+
+        # Se muestran las opciones que ofrece la empresa
+        print(f"\nOpciones de {titulo}:")
+        for i, (nombre, tarifa, extra) in enumerate(opciones, 1):
+            detalle = ", ".join(f"{k}: {v}" for k, v in extra.items())
+            print(f"    {i}. {nombre} (${tarifa:,.0f}/h) - {detalle}")
+        print(f"    {len(opciones) + 1}. Otro (escribir los datos a mano)")
+        print("    0. Volver atras")
+
+        try:
+            eleccion = pedir("Elige una opcion: ", opcion_o_volver(len(opciones) + 1))
+        except VolverAtras:
+            continue  # vuelve a elegir el tipo de servicio
+
+        # Opcion del catalogo
+        if eleccion <= len(opciones):
+            nombre, tarifa, extra = opciones[eleccion - 1]
+            return g.registrar_servicio(clase, nombre, tarifa, **extra)
+
+        # Opcion manual (cada dato se pide y se valida por separado)
+        nombre = pedir("Nombre del servicio: ", texto_obligatorio("el nombre"))
+        tarifa = pedir("Tarifa por hora: ", numero_positivo)
+        if tipo == "1":
+            capacidad = pedir("Capacidad (personas): ", entero_positivo)
+            return g.registrar_servicio(ReservaSala, nombre, tarifa, capacidad)
+        if tipo == "2":
+            equipo = pedir("Tipo de equipo: ", texto_obligatorio("el tipo de equipo"))
+            deposito = pedir("Deposito: ", numero_no_negativo)
+            return g.registrar_servicio(AlquilerEquipo, nombre, tarifa, equipo, deposito=deposito)
+        especialidad = pedir("Especialidad: ", texto_obligatorio("la especialidad"))
+        nivel = pedir("Nivel (junior/senior): ", nivel_valido)
+        return g.registrar_servicio(AsesoriaEspecializada, nombre, tarifa, especialidad, nivel)
+
+
+# ----- Reservas -----
+def mostrar_numerada(lista_texto, si_esta_vacia):
+    if not lista_texto:
+        raise ReservaInvalidaError(si_esta_vacia)
+    for linea in lista_texto:
+        print("   ", linea)
+
+
+# Elige una reserva y revisa que este en un estado permitido (0 = volver)
+def elegir_reserva(g, estados_ok):
+    lista = g.listar_reservas()
+    mostrar_numerada(lista, "No hay reservas. Primero crea una con la opcion 3")
+    print("    0. Volver al menu")
+
+    def validar(valor):
+        n = opcion_o_volver(len(lista))(valor)
+        estado = g.reserva_en(n - 1).estado
+        if estado not in estados_ok:
+            raise OperacionNoPermitidaError(
+                f"La reserva {n} esta {estado}, se necesita una {' o '.join(estados_ok)}")
+        return n - 1
+
+    return pedir("Numero de la reserva: ", validar)
+
+
+def menu_crear_reserva(g):
+    clientes = g.listar_clientes()
+    if not clientes:
+        raise ReservaInvalidaError("No hay clientes. Primero registra uno con la opcion 1")
+    servicios = g.listar_servicios()
+    if not servicios:
+        raise ReservaInvalidaError("No hay servicios. Primero registra uno con la opcion 2")
+
+    def validar_servicio(valor):
+        n = opcion_o_volver(len(servicios))(valor)
+        servicio = g.servicio_en(n - 1)
+        if not servicio.disponible:
+            raise ServicioNoDisponibleError(f"El servicio '{servicio.nombre}' no esta disponible")
+        return n - 1
+
+    # Se hace por pasos: 1 cliente, 2 servicio, 3 horas
+    # Con 0 se vuelve al paso anterior (en el paso 1 se vuelve al menu)
+    paso = 1
+    while True:
+        try:
+            if paso == 1:
+                print("\nClientes:")
+                mostrar_numerada(clientes, "")
+                print("    0. Volver al menu")
+                c = pedir("Numero del cliente: ", opcion_o_volver(len(clientes))) - 1
+                paso = 2
+            elif paso == 2:
+                print("\nServicios:")
+                mostrar_numerada(servicios, "")
+                print("    0. Volver atras")
+                s = pedir("Numero del servicio: ", validar_servicio)
+                paso = 3
+            else:
+                servicio = g.servicio_en(s)
+
+                # Las horas se revisan con las reglas del servicio elegido
+                def validar_horas(valor):
+                    horas = a_numero(valor)
+                    if horas == 0:
+                        raise VolverAtras()
+                    try:
+                        servicio.validar_parametros(horas)
+                    except ServicioInvalidoError as e:
+                        raise ReservaInvalidaError(f"Duracion invalida: {horas} ({e})") from e
+                    return horas
+
+                horas = pedir("\nCantidad de horas (0 para volver atras): ", validar_horas)
+                # Se crea PENDIENTE, despues se confirma con la opcion 4
+                return g.crear_reserva(c, s, horas, confirmar=False)
+        except VolverAtras:
+            if paso == 1:
+                raise  # en el primer paso se sale al menu principal
+            paso -= 1
+
+
+def menu_confirmar_reserva(g):
+    r = elegir_reserva(g, (Reserva.PENDIENTE,))
+    return g.confirmar_reserva(r)
+
+
+def menu_cancelar_reserva(g):
+    r = elegir_reserva(g, (Reserva.PENDIENTE, Reserva.CONFIRMADA))
+    return g.cancelar_reserva(r)
+
+
+def menu_procesar_reserva(g):
+    while True:
+        print("Reservas (se pueden procesar las CONFIRMADAS):")
+        r = elegir_reserva(g, (Reserva.CONFIRMADA,))  # 0 sale al menu principal
+
+        while True:
+            print("\nComo quieres calcular el costo?")
+            print("    1. Normal (con IVA del 19%)")
+            print("    2. Con IVA del 19% y un descuento")
+            print("    3. Personalizado (escribir IVA y descuento)")
+            print("    0. Volver atras")
+            try:
+                opcion = pedir("Elige una opcion: ", opcion_o_volver(3))
+            except VolverAtras:
+                break  # vuelve a elegir la reserva
+
+            # Opcion 1: sin parametros (sobrecarga)
+            if opcion == 1:
+                return g.procesar_reserva(r)
+
+            # Opcion 2: un parametro (sobrecarga)
+            if opcion == 2:
+                print("\nDescuento:")
+                print("    1. 5%")
+                print("    2. 10%")
+                print("    3. 15%")
+                print("    0. Volver atras")
+                try:
+                    d = pedir("Elige una opcion: ", opcion_o_volver(3))
+                except VolverAtras:
+                    continue  # vuelve a elegir como calcular
+                return g.procesar_reserva(r, {1: 0.05, 2: 0.10, 3: 0.15}[d])
+
+            # Opcion 3: dos parametros (sobrecarga)
+            iva = pedir("IVA (ej 0.19): ", porcentaje("El IVA", 1))
+            descuento = pedir("Descuento (ej 0.10): ", porcentaje("El descuento", 0.99))
+            return g.procesar_reserva(r, iva, descuento)
+
+
+# Espera un Enter para que de tiempo de leer antes de volver al menu
+def pausar():
+    try:
+        input("\nPresiona Enter para volver al menu...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+# Muestra una lista completa
+def mostrar_lista(titulo, lineas):
+    print(f"\n--- {titulo} ---")
+    if not lineas:
+        print("    (vacio)")
+    for linea in lineas:
+        print("   ", linea)
+
+
+# Muestra las ultimas lineas del archivo de log
+def ver_log():
+    print(f"\n--- LOG ({RUTA_LOG}) ---")
+    try:
+        with open(RUTA_LOG, "r", encoding="utf-8") as archivo:
+            for linea in archivo.readlines()[-25:]:
+                print(linea.rstrip())
+    except FileNotFoundError:
+        print("    Todavia no existe el archivo de log")
+
+
+def menu():
+    g = GestorSoftwareFJ()
+    logger.info("Programa iniciado")
+    print("Archivo de log en:", RUTA_LOG)
+
+    while True:
+        print("\n" + "=" * 40)
+        print("CONTROL DE REGISTRO".center(40))
+        print("=" * 40)
+        print(g.estado())
+        print("Orden para reservar: 1 -> 2 -> 3 -> 4 -> 5")
+        print("-" * 40)
+        print("1. Registrar cliente")
+        print("2. Registrar servicio")
+        print("3. Crear reserva")
+        print("4. Confirmar reserva")
+        print("5. Procesar reserva (calcular costo)")
+        print("6. Cancelar reserva")
+        print("7. Ver clientes, servicios y reservas")
+        print("8. Ejecutar simulacion automatica (22 operaciones)")
+        print("9. Ver el log")
+        print("0. Salir")
+
+        try:
+            opcion = input("Elige una opcion: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            opcion = "0"
+
+        if opcion == "1":
+            g._ejecutar("Registrar cliente", lambda: menu_registrar_cliente(g))
+        elif opcion == "2":
+            g._ejecutar("Registrar servicio", lambda: menu_registrar_servicio(g))
+        elif opcion == "3":
+            g._ejecutar("Crear reserva", lambda: menu_crear_reserva(g))
+        elif opcion == "4":
+            g._ejecutar("Confirmar reserva", lambda: menu_confirmar_reserva(g))
+        elif opcion == "5":
+            g._ejecutar("Procesar reserva", lambda: menu_procesar_reserva(g))
+        elif opcion == "6":
+            g._ejecutar("Cancelar reserva", lambda: menu_cancelar_reserva(g))
+        elif opcion == "7":
+            mostrar_lista("CLIENTES", g.listar_clientes())
+            mostrar_lista("SERVICIOS", g.listar_servicios())
+            mostrar_lista("RESERVAS", g.listar_reservas())
+            pausar()
+        elif opcion == "8":
+            print("\n(La simulacion usa sus propios datos de prueba, no los que registraste tu)")
+            simular()
+            pausar()    
+        elif opcion == "9":
+            ver_log()
+            pausar()
+        elif opcion == "0":
+            logger.info("Programa terminado por el usuario")
+            print("Hasta luego!")
+            break
+        else:
+            logger.warning("Opcion de menu invalida: %r", opcion)
+            print("    Opcion no valida, intenta de nuevo")
+
+
+# Aqui empieza el programa
+if __name__ == "__main__":
+    menu()
